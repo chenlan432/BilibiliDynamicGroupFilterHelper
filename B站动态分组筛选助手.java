@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         B站动态分组筛选助手 v5.0
+// @name         B站动态分组筛选助手 v11.0
 // @namespace    http://tampermonkey.net/
-// @version      5.0
-// @description  在B站动态页面按关注分组筛选动态（持久化存储版）
+// @version      11.0
+// @description  在B站动态页面按关注分组筛选动态（最终修复版）
 // @author       You
 // @match        https://t.bilibili.com/*
 // @grant        GM_xmlhttpRequest
@@ -25,17 +25,26 @@
     let panelVisible = false;
     let filterStats = { total: 0, shown: 0 };
     let isReady = false;
+    let debugMode = true;
 
-    // ==================== 初始化加载已保存的分组成员 ====================
+    // ==================== 调试日志 ====================
+    function debugLog(...args) {
+        if (debugMode) {
+            console.log('[分组筛选]', ...args);
+        }
+    }
+
+    // ==================== 初始化 ====================
     async function initSavedGroup() {
         if (currentGroupId) {
-            console.log(`[分组筛选] 检测到已保存的分组ID: ${currentGroupId}，正在加载成员...`);
+            debugLog(`检测到已保存的分组ID: ${currentGroupId}，正在加载成员...`);
             const members = await getGroupMembersSync(currentGroupId);
             if (members && members.length > 0) {
-                currentGroupMemberSet = new Set(members);
-                console.log(`[分组筛选] 分组成员加载完成，共 ${members.length} 人`);
+                // 使用字符串Set
+                currentGroupMemberSet = new Set(members.map(m => String(m)));
+                debugLog(`分组成员加载完成，共 ${members.length} 人`);
+                debugLog(`成员示例:`, Array.from(currentGroupMemberSet).slice(0, 5));
             } else {
-                console.log(`[分组筛选] 分组成员加载失败或为空`);
                 currentGroupId = null;
                 currentGroupMemberSet = null;
                 GM_setValue('currentGroupId', null);
@@ -44,12 +53,14 @@
         isReady = true;
     }
 
-    // 同步获取分组成员（使用Promise等待）
     function getGroupMembersSync(tagId) {
         return new Promise((resolve) => {
-            // 先检查缓存
             const cached = GM_getValue(`members_${tagId}`, null);
-            if (cached && cached.length > 0) {
+            const cacheTime = GM_getValue(`members_${tagId}_time`, 0);
+            const now = Date.now();
+
+            // 缓存1小时
+            if (cached && cached.length > 0 && (now - cacheTime < 3600000)) {
                 groupMembers[tagId] = cached;
                 resolve(cached);
                 return;
@@ -68,25 +79,28 @@
                         try {
                             const data = JSON.parse(response.responseText);
                             if (data.code === 0 && data.data && data.data.length > 0) {
-                                data.data.forEach(user => allMembers.push(user.mid));
+                                data.data.forEach(user => {
+                                    // 字符串存储
+                                    allMembers.push(String(user.mid));
+                                });
                                 if (data.data.length === 50) {
                                     currentPage++;
                                     setTimeout(fetchPage, 50);
                                 } else {
                                     groupMembers[tagId] = allMembers;
                                     GM_setValue(`members_${tagId}`, allMembers);
+                                    GM_setValue(`members_${tagId}_time`, now);
                                     resolve(allMembers);
                                 }
                             } else {
                                 groupMembers[tagId] = allMembers;
                                 if (allMembers.length > 0) {
                                     GM_setValue(`members_${tagId}`, allMembers);
+                                    GM_setValue(`members_${tagId}_time`, now);
                                 }
                                 resolve(allMembers);
                             }
-                        } catch (e) { 
-                            resolve(allMembers); 
-                        }
+                        } catch (e) { resolve(allMembers); }
                     },
                     onerror: () => resolve(allMembers)
                 });
@@ -95,15 +109,30 @@
         });
     }
 
-    // ==================== API 拦截（在初始化完成后生效） ====================
+    // ==================== 提取mid ====================
+    function extractMidFromItem(item) {
+        const possibleMids = [
+            item?.modules?.module_author?.mid,
+            item?.modules?.module_author?.avatar?.mid,
+            item?.module_author?.mid,
+            item?.author?.mid,
+        ];
+
+        for (const mid of possibleMids) {
+            if (mid !== undefined && mid !== null) {
+                return String(mid);
+            }
+        }
+        return null;
+    }
+
+    // ==================== API 拦截 - 核心过滤逻辑 ====================
     const originalFetch = unsafeWindow.fetch;
     unsafeWindow.fetch = async function(...args) {
         const response = await originalFetch.apply(this, args);
         const url = args[0]?.url || args[0];
 
-        // 拦截动态列表API
         if (typeof url === 'string' && url.includes('/x/polymer/web-dynamic/v1/feed/all')) {
-            // 等待初始化完成
             if (!isReady) {
                 await new Promise(resolve => {
                     const check = setInterval(() => {
@@ -121,20 +150,25 @@
                     const data = await clone.json();
                     if (data.code === 0 && data.data && data.data.items) {
                         const originalCount = data.data.items.length;
-                        
-                        // 筛选属于当前分组的动态
-                        data.data.items = data.data.items.filter(item => {
-                            const mid = item?.modules?.module_author?.mid;
+                        const originalHasMore = data.data.has_more;
+
+                        // 核心：筛选匹配的动态
+                        const filteredItems = data.data.items.filter(item => {
+                            const mid = extractMidFromItem(item);
                             return mid && currentGroupMemberSet.has(mid);
                         });
 
-                        const filteredCount = data.data.items.length;
+                        const filteredCount = filteredItems.length;
                         filterStats.total += originalCount;
                         filterStats.shown += filteredCount;
-                        
-                        console.log(`[分组筛选] API拦截成功: ${originalCount} -> ${filteredCount}`);
 
-                        // 返回修改后的响应
+                        debugLog(`API拦截: ${originalCount} -> ${filteredCount}, has_more: ${originalHasMore}`);
+
+                        // 替换为筛选后的数据
+                        data.data.items = filteredItems;
+
+                        updateStatusText();
+
                         return new Response(JSON.stringify(data), {
                             status: response.status,
                             statusText: response.statusText,
@@ -149,7 +183,6 @@
         return response;
     };
 
-    // 立即开始初始化
     initSavedGroup();
 
     // ==================== 样式 ====================
@@ -163,8 +196,8 @@
             border-radius: 12px;
             box-shadow: 0 4px 20px rgba(0,0,0,0.15);
             padding: 15px;
-            min-width: 250px;
-            max-height: 70vh;
+            min-width: 280px;
+            max-height: 75vh;
             overflow-y: auto;
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             display: none;
@@ -233,19 +266,12 @@
             font-size: 12px;
             color: #666;
             padding: 10px;
-            background: #e8f5e9;
+            background: #fff3e0;
             border-radius: 6px;
             margin-top: 10px;
             line-height: 1.6;
         }
-        .gf-tip.warning {
-            background: #fff3e0;
-        }
-        .gf-loading {
-            text-align: center;
-            padding: 20px;
-            color: #999;
-        }
+        .gf-loading { text-align: center; padding: 20px; color: #999; }
         .gf-current {
             font-size: 12px;
             color: #ff9800;
@@ -266,28 +292,39 @@
             cursor: pointer;
             font-size: 12px;
         }
-        .gf-clear-btn:hover {
-            background: #e64a19;
+        .gf-clear-btn:hover { background: #e64a19; }
+        .gf-action-btn {
+            width: 100%;
+            margin-top: 8px;
+            padding: 10px;
+            color: #fff;
+            border: none;
+            border-radius: 8px;
+            font-size: 13px;
+            cursor: pointer;
+            font-weight: 500;
+            transition: all 0.2s;
         }
+        .gf-action-btn:hover { opacity: 0.9; transform: translateY(-1px); }
+        .gf-action-btn.primary { background: linear-gradient(135deg, #4caf50, #66bb6a); }
+        .gf-action-btn.warning { background: linear-gradient(135deg, #ff9800, #ffb74d); }
     `);
 
-    // ==================== UI 创建 ====================
+    // ==================== UI ====================
     function createUI() {
-        // 切换按钮
         const btn = document.createElement('button');
         btn.className = 'gf-btn';
         btn.id = 'gf-toggle-btn';
-        
-        // 根据是否有筛选状态设置按钮样式
+
         if (currentGroupId) {
             btn.classList.add('filtering');
-            btn.innerHTML = '🔍 筛选中...';
+            const name = GM_getValue('currentGroupName', '筛选中');
+            btn.innerHTML = `🔍 ${name}`;
         } else {
             btn.innerHTML = '📁 分组筛选';
         }
         document.body.appendChild(btn);
 
-        // 面板
         const panel = document.createElement('div');
         panel.className = 'gf-container';
         panel.id = 'gf-panel';
@@ -304,7 +341,6 @@
         });
     }
 
-    // ==================== 加载分组列表 ====================
     function loadGroups() {
         GM_xmlhttpRequest({
             method: 'GET',
@@ -318,26 +354,25 @@
                         groups = data.data;
                         renderPanel();
                     } else {
-                        document.getElementById('gf-panel').innerHTML = 
+                        document.getElementById('gf-panel').innerHTML =
                             '<div class="gf-loading">⚠️ 获取分组失败，请确保已登录B站</div>';
                     }
                 } catch (e) {
-                    document.getElementById('gf-panel').innerHTML = 
+                    document.getElementById('gf-panel').innerHTML =
                         '<div class="gf-loading">⚠️ 数据解析错误</div>';
                 }
             },
             onerror: () => {
-                document.getElementById('gf-panel').innerHTML = 
+                document.getElementById('gf-panel').innerHTML =
                     '<div class="gf-loading">⚠️ 网络错误</div>';
             }
         });
     }
 
-    // ==================== 面板渲染 ====================
     function renderPanel() {
         const panel = document.getElementById('gf-panel');
         const savedGroupName = GM_getValue('currentGroupName', '');
-        
+
         let html = `
             <div class="gf-title">
                 <span>📁 关注分组筛选</span>
@@ -345,12 +380,11 @@
             </div>
         `;
 
-        // 显示当前筛选状态
         if (currentGroupId && savedGroupName) {
             html += `
                 <div class="gf-current">
-                    <span>🔍 当前筛选：<strong>${savedGroupName}</strong></span>
-                    <button class="gf-clear-btn" id="gf-clear">取消</button>
+                    <span>🔍 当前：<strong>${savedGroupName}</strong></span>
+                    <button class="gf-clear-btn" id="gf-clear">取消筛选</button>
                 </div>
             `;
         }
@@ -360,7 +394,7 @@
                 <span>📺 显示全部动态</span>
             </div>
         `;
-        
+
         groups.forEach(g => {
             html += `
                 <div class="gf-item ${currentGroupId === g.tagid ? 'active' : ''}" data-id="${g.tagid}" data-name="${g.name}">
@@ -369,59 +403,58 @@
                 </div>
             `;
         });
-        
+
         html += `
             <div class="gf-status" id="gf-status">
-                ${currentGroupId ? `筛选生效中，已显示 ${filterStats.shown} 条` : '点击分组开始筛选'}
+                ${currentGroupId ? `✅ 筛选中 | 显示 ${filterStats.shown} 条` : '选择分组开始筛选'}
             </div>
+
+            <button id="gf-refresh-btn" class="gf-action-btn primary">🔄 刷新页面应用筛选</button>
+            <button id="gf-clearcache-btn" class="gf-action-btn warning">🗑️ 清除缓存重新加载</button>
+
             <div class="gf-tip">
-                💡 <strong>使用说明：</strong><br>
-                1. 选择一个分组<br>
-                2. 点击下方「刷新页面」按钮<br>
-                3. 筛选设置会自动保存，持续生效
+                ⚠️ <strong>重要说明：</strong><br>
+                B站动态API限制只能获取<strong>最近几个月</strong>的动态，这是B站服务器的限制，无法突破。<br><br>
+                📖 使用方法：选择分组 → 点击刷新 → 向下滚动加载更多
             </div>
-            <button id="gf-refresh-btn" style="
-                width: 100%;
-                margin-top: 10px;
-                padding: 12px;
-                background: linear-gradient(135deg, #4caf50, #66bb6a);
-                color: #fff;
-                border: none;
-                border-radius: 8px;
-                font-size: 14px;
-                cursor: pointer;
-                font-weight: 500;
-            ">🔄 刷新页面应用筛选</button>
         `;
         panel.innerHTML = html;
 
-        // 绑定关闭事件
+        // 绑定事件
         document.getElementById('gf-close').addEventListener('click', () => {
             panelVisible = false;
             panel.style.display = 'none';
             document.getElementById('gf-toggle-btn').style.display = 'block';
         });
 
-        // 绑定取消筛选按钮
         const clearBtn = document.getElementById('gf-clear');
         if (clearBtn) {
-            clearBtn.addEventListener('click', () => {
-                clearFilter();
-            });
+            clearBtn.addEventListener('click', clearFilter);
         }
 
-        // 绑定刷新按钮
         document.getElementById('gf-refresh-btn').addEventListener('click', () => {
             location.reload();
         });
 
-        // 绑定分组点击事件
+        document.getElementById('gf-clearcache-btn').addEventListener('click', async () => {
+            groups.forEach(g => {
+                GM_setValue(`members_${g.tagid}`, null);
+                GM_setValue(`members_${g.tagid}_time`, 0);
+            });
+            if (currentGroupId) {
+                GM_setValue(`members_${currentGroupId}`, null);
+                GM_setValue(`members_${currentGroupId}_time`, 0);
+            }
+            alert('缓存已清除，即将刷新页面');
+            location.reload();
+        });
+
+        // 分组点击
         panel.querySelectorAll('.gf-item').forEach(item => {
             item.addEventListener('click', async () => {
                 const tagId = item.dataset.id;
                 const tagName = item.dataset.name || '';
-                
-                // 更新选中状态
+
                 panel.querySelectorAll('.gf-item').forEach(i => i.classList.remove('active'));
                 item.classList.add('active');
 
@@ -434,58 +467,60 @@
         });
     }
 
-    // 选择分组
+    function updateStatusText() {
+        const el = document.getElementById('gf-status');
+        if (el && currentGroupId) {
+            el.textContent = `✅ 筛选中 | 已显示 ${filterStats.shown} 条，已过滤 ${filterStats.total - filterStats.shown} 条`;
+        }
+    }
+
     async function selectGroup(tagId, tagName) {
         const statusEl = document.getElementById('gf-status');
         if (statusEl) statusEl.textContent = '正在加载分组成员...';
 
+        // 清除缓存获取最新数据
+        GM_setValue(`members_${tagId}`, null);
+        GM_setValue(`members_${tagId}_time`, 0);
+
         const members = await getGroupMembersSync(tagId);
-        
+
         if (members.length === 0) {
             if (statusEl) statusEl.textContent = '⚠️ 该分组没有成员';
             return;
         }
 
-        // 保存到持久化存储
         currentGroupId = tagId;
-        currentGroupMemberSet = new Set(members);
+        currentGroupMemberSet = new Set(members.map(m => String(m)));
+        filterStats = { total: 0, shown: 0 };
+
         GM_setValue('currentGroupId', tagId);
         GM_setValue('currentGroupName', tagName);
-        
-        console.log(`[分组筛选] 已选择分组: ${tagName}, 成员数: ${members.length}`);
-        
-        // 更新UI
+
+        debugLog(`已选择分组: ${tagName}, 成员数: ${members.length}`);
+
         const btn = document.getElementById('gf-toggle-btn');
         btn.classList.add('filtering');
         btn.innerHTML = `🔍 ${tagName}`;
-        
+
         if (statusEl) {
-            statusEl.textContent = `已选择「${tagName}」(${members.length}人)，请点击下方按钮刷新页面`;
+            statusEl.textContent = `已选择「${tagName}」(${members.length}人)，请刷新页面`;
         }
 
-        // 重新渲染面板显示当前状态
         renderPanel();
     }
 
-    // 清除筛选
     function clearFilter() {
         currentGroupId = null;
         currentGroupMemberSet = null;
         filterStats = { total: 0, shown: 0 };
-        
+
         GM_setValue('currentGroupId', null);
         GM_setValue('currentGroupName', '');
-        
+
         const btn = document.getElementById('gf-toggle-btn');
         btn.classList.remove('filtering');
         btn.innerHTML = '📁 分组筛选';
-        
-        const statusEl = document.getElementById('gf-status');
-        if (statusEl) {
-            statusEl.textContent = '已取消筛选，请刷新页面查看全部动态';
-        }
 
-        // 重新渲染面板
         renderPanel();
     }
 
@@ -493,16 +528,7 @@
     function init() {
         if (document.body) {
             createUI();
-            // 如果有已保存的分组，更新按钮状态
-            if (currentGroupId) {
-                const groupName = GM_getValue('currentGroupName', '筛选中');
-                const btn = document.getElementById('gf-toggle-btn');
-                if (btn) {
-                    btn.classList.add('filtering');
-                    btn.innerHTML = `🔍 ${groupName}`;
-                }
-            }
-            console.log('[分组筛选] v5.0 持久化存储版已加载');
+            debugLog('v11.0 最终修复版已加载');
         } else {
             document.addEventListener('DOMContentLoaded', init);
         }
