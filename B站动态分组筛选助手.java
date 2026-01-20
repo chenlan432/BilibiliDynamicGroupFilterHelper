@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         B站动态分组筛选助手 v11.0
+// @name         B站动态分组筛选助手 v16.1
 // @namespace    http://tampermonkey.net/
-// @version      11.0
-// @description  在B站动态页面按关注分组筛选动态（最终修复版）
+// @version      16.1
+// @description  在B站动态页面按关注分组筛选动态
 // @author       You
 // @match        https://t.bilibili.com/*
 // @grant        GM_xmlhttpRequest
@@ -17,527 +17,295 @@
 (function() {
     'use strict';
 
-    // ==================== 全局变量 ====================
     let groups = [];
-    let groupMembers = {};
     let currentGroupId = GM_getValue('currentGroupId', null);
     let currentGroupMemberSet = null;
     let panelVisible = false;
     let filterStats = { total: 0, shown: 0 };
     let isReady = false;
-    let debugMode = true;
+    let hasMore = true;
+    let isLoading = false;
+    let emptyCount = 0;
 
-    // ==================== 调试日志 ====================
-    function debugLog(...args) {
-        if (debugMode) {
-            console.log('[分组筛选]', ...args);
-        }
-    }
+    const log = (...args) => console.log('[分组筛选]', ...args);
 
-    // ==================== 初始化 ====================
-    async function initSavedGroup() {
+    // ========== 初始化 ==========
+    async function init() {
         if (currentGroupId) {
-            debugLog(`检测到已保存的分组ID: ${currentGroupId}，正在加载成员...`);
-            const members = await getGroupMembersSync(currentGroupId);
-            if (members && members.length > 0) {
-                // 使用字符串Set
-                currentGroupMemberSet = new Set(members.map(m => String(m)));
-                debugLog(`分组成员加载完成，共 ${members.length} 人`);
-                debugLog(`成员示例:`, Array.from(currentGroupMemberSet).slice(0, 5));
+            log(`加载分组: ${currentGroupId}`);
+            const members = await fetchMembers(currentGroupId);
+            if (members?.length) {
+                currentGroupMemberSet = new Set(members.map(String));
+                log(`成员数: ${members.length}`);
             } else {
                 currentGroupId = null;
-                currentGroupMemberSet = null;
                 GM_setValue('currentGroupId', null);
             }
         }
         isReady = true;
     }
 
-    function getGroupMembersSync(tagId) {
-        return new Promise((resolve) => {
-            const cached = GM_getValue(`members_${tagId}`, null);
-            const cacheTime = GM_getValue(`members_${tagId}_time`, 0);
-            const now = Date.now();
-
-            // 缓存1小时
-            if (cached && cached.length > 0 && (now - cacheTime < 3600000)) {
-                groupMembers[tagId] = cached;
-                resolve(cached);
-                return;
+    function fetchMembers(tagId) {
+        return new Promise(resolve => {
+            const cached = GM_getValue(`m_${tagId}`, null);
+            const time = GM_getValue(`t_${tagId}`, 0);
+            if (cached?.length && Date.now() - time < 3600000) {
+                return resolve(cached);
             }
-
-            const allMembers = [];
-            let currentPage = 1;
-
-            function fetchPage() {
+            const all = [];
+            let p = 1;
+            const get = () => {
                 GM_xmlhttpRequest({
                     method: 'GET',
-                    url: `https://api.bilibili.com/x/relation/tag?tagid=${tagId}&pn=${currentPage}&ps=50`,
+                    url: `https://api.bilibili.com/x/relation/tag?tagid=${tagId}&pn=${p}&ps=50`,
                     withCredentials: true,
-                    headers: { 'Referer': 'https://t.bilibili.com/' },
-                    onload: function(response) {
+                    onload: r => {
                         try {
-                            const data = JSON.parse(response.responseText);
-                            if (data.code === 0 && data.data && data.data.length > 0) {
-                                data.data.forEach(user => {
-                                    // 字符串存储
-                                    allMembers.push(String(user.mid));
-                                });
-                                if (data.data.length === 50) {
-                                    currentPage++;
-                                    setTimeout(fetchPage, 50);
-                                } else {
-                                    groupMembers[tagId] = allMembers;
-                                    GM_setValue(`members_${tagId}`, allMembers);
-                                    GM_setValue(`members_${tagId}_time`, now);
-                                    resolve(allMembers);
+                            const d = JSON.parse(r.responseText);
+                            if (d.code === 0 && d.data) {
+                                d.data.forEach(u => all.push(String(u.mid)));
+                                if (d.data.length === 50) { p++; setTimeout(get, 30); }
+                                else {
+                                    GM_setValue(`m_${tagId}`, all);
+                                    GM_setValue(`t_${tagId}`, Date.now());
+                                    resolve(all);
                                 }
-                            } else {
-                                groupMembers[tagId] = allMembers;
-                                if (allMembers.length > 0) {
-                                    GM_setValue(`members_${tagId}`, allMembers);
-                                    GM_setValue(`members_${tagId}_time`, now);
-                                }
-                                resolve(allMembers);
-                            }
-                        } catch (e) { resolve(allMembers); }
+                            } else resolve(all);
+                        } catch { resolve(all); }
                     },
-                    onerror: () => resolve(allMembers)
+                    onerror: () => resolve(all)
                 });
-            }
-            fetchPage();
+            };
+            get();
         });
     }
 
-    // ==================== 提取mid ====================
-    function extractMidFromItem(item) {
-        const possibleMids = [
-            item?.modules?.module_author?.mid,
-            item?.modules?.module_author?.avatar?.mid,
-            item?.module_author?.mid,
-            item?.author?.mid,
-        ];
-
-        for (const mid of possibleMids) {
-            if (mid !== undefined && mid !== null) {
-                return String(mid);
-            }
-        }
-        return null;
+    // ========== 触发滚动 ==========
+    function triggerScroll() {
+        if (isLoading) return;
+        isLoading = true;
+        window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'instant' });
+        setTimeout(() => { isLoading = false; }, 150);
     }
 
-    // ==================== API 拦截 - 核心过滤逻辑 ====================
-    const originalFetch = unsafeWindow.fetch;
+    // ========== API拦截 ==========
+    const _fetch = unsafeWindow.fetch;
     unsafeWindow.fetch = async function(...args) {
-        const response = await originalFetch.apply(this, args);
+        const res = await _fetch.apply(this, args);
         const url = args[0]?.url || args[0];
 
         if (typeof url === 'string' && url.includes('/x/polymer/web-dynamic/v1/feed/all')) {
-            if (!isReady) {
-                await new Promise(resolve => {
-                    const check = setInterval(() => {
-                        if (isReady) {
-                            clearInterval(check);
-                            resolve();
-                        }
-                    }, 50);
-                });
-            }
+            if (!isReady) await new Promise(r => { const c = setInterval(() => { if (isReady) { clearInterval(c); r(); } }, 30); });
 
-            if (currentGroupMemberSet && currentGroupMemberSet.size > 0) {
-                const clone = response.clone();
+            if (currentGroupMemberSet?.size) {
                 try {
+                    const clone = res.clone();
                     const data = await clone.json();
-                    if (data.code === 0 && data.data && data.data.items) {
-                        const originalCount = data.data.items.length;
-                        const originalHasMore = data.data.has_more;
 
-                        // 核心：筛选匹配的动态
-                        const filteredItems = data.data.items.filter(item => {
-                            const mid = extractMidFromItem(item);
+                    if (data.code === 0 && data.data) {
+                        const items = data.data.items || [];
+                        const origLen = items.length;
+                        hasMore = data.data.has_more;
+
+                        // 筛选匹配的动态
+                        const filtered = items.filter(item => {
+                            const mid = String(item?.modules?.module_author?.mid || '');
                             return mid && currentGroupMemberSet.has(mid);
                         });
 
-                        const filteredCount = filteredItems.length;
-                        filterStats.total += originalCount;
-                        filterStats.shown += filteredCount;
+                        filterStats.total += origLen;
+                        filterStats.shown += filtered.length;
 
-                        debugLog(`API拦截: ${originalCount} -> ${filteredCount}, has_more: ${originalHasMore}`);
+                        log(`过滤: ${origLen} -> ${filtered.length}, hasMore: ${hasMore}`);
 
-                        // 替换为筛选后的数据
-                        data.data.items = filteredItems;
+                        // 核心策略：筛选后为空但还有更多数据时，保留占位项并自动加载
+                        if (filtered.length === 0 && hasMore && items.length > 0) {
+                            emptyCount++;
+                            // 保留一个占位项（会显示但马上被下一批数据覆盖）
+                            const placeholder = JSON.parse(JSON.stringify(items[0]));
+                            data.data.items = [placeholder];
+                            
+                            // 自动触发加载下一页
+                            const delay = Math.min(100 + emptyCount * 10, 500);
+                            setTimeout(triggerScroll, delay);
+                            
+                            showLoading(true);
+                        } else {
+                            data.data.items = filtered;
+                            if (filtered.length > 0) emptyCount = 0;
+                            showLoading(false);
+                        }
 
-                        updateStatusText();
+                        if (!hasMore) {
+                            showLoading(false);
+                            log('已到达数据末尾');
+                        }
+
+                        updateUI();
 
                         return new Response(JSON.stringify(data), {
-                            status: response.status,
-                            statusText: response.statusText,
-                            headers: response.headers
+                            status: res.status,
+                            statusText: res.statusText,
+                            headers: res.headers
                         });
                     }
                 } catch (e) {
-                    console.error('[分组筛选] 处理响应失败:', e);
+                    console.error('[分组筛选]', e);
                 }
             }
         }
-        return response;
+        return res;
     };
 
-    initSavedGroup();
+    init();
 
-    // ==================== 样式 ====================
+    // ========== 样式 ==========
     GM_addStyle(`
-        .gf-container {
-            position: fixed;
-            top: 70px;
-            right: 20px;
-            z-index: 99999;
-            background: #fff;
-            border-radius: 12px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.15);
-            padding: 15px;
-            min-width: 280px;
-            max-height: 75vh;
-            overflow-y: auto;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            display: none;
-        }
-        .gf-container::-webkit-scrollbar { width: 6px; }
-        .gf-container::-webkit-scrollbar-thumb { background: #ddd; border-radius: 3px; }
-        .gf-title {
-            font-weight: bold;
-            font-size: 15px;
-            margin-bottom: 12px;
-            color: #00a1d6;
-            border-bottom: 2px solid #00a1d6;
-            padding-bottom: 10px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .gf-item {
-            padding: 10px 14px;
-            margin: 6px 0;
-            cursor: pointer;
-            border-radius: 8px;
-            transition: all 0.2s ease;
-            font-size: 14px;
-            background: #f5f5f5;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .gf-item:hover { background: #e3f2fd; transform: translateX(3px); }
-        .gf-item.active {
-            background: linear-gradient(135deg, #00a1d6, #00b5e5);
-            color: #fff;
-            box-shadow: 0 2px 8px rgba(0,161,214,0.4);
-        }
-        .gf-item .count { font-size: 12px; opacity: 0.8; }
-        .gf-btn {
-            position: fixed;
-            top: 70px;
-            right: 20px;
-            z-index: 100000;
-            background: linear-gradient(135deg, #00a1d6, #00b5e5);
-            color: #fff;
-            border: none;
-            padding: 12px 18px;
-            border-radius: 25px;
-            cursor: pointer;
-            font-size: 14px;
-            font-weight: 500;
-            box-shadow: 0 4px 15px rgba(0,161,214,0.4);
-            transition: all 0.3s ease;
-        }
-        .gf-btn:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(0,161,214,0.5); }
-        .gf-btn.filtering { background: linear-gradient(135deg, #ff9800, #ffb74d); }
-        .gf-close { cursor: pointer; font-size: 18px; color: #999; transition: color 0.2s; }
-        .gf-close:hover { color: #ff6b6b; }
-        .gf-status {
-            font-size: 12px;
-            color: #666;
-            padding: 8px 0;
-            border-top: 1px solid #eee;
-            margin-top: 10px;
-            text-align: center;
-        }
-        .gf-tip {
-            font-size: 12px;
-            color: #666;
-            padding: 10px;
-            background: #fff3e0;
-            border-radius: 6px;
-            margin-top: 10px;
-            line-height: 1.6;
-        }
-        .gf-loading { text-align: center; padding: 20px; color: #999; }
-        .gf-current {
-            font-size: 12px;
-            color: #ff9800;
-            padding: 8px 10px;
-            background: #fff3e0;
-            border-radius: 6px;
-            margin-bottom: 10px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .gf-clear-btn {
-            background: #ff5722;
-            color: #fff;
-            border: none;
-            padding: 4px 10px;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 12px;
-        }
-        .gf-clear-btn:hover { background: #e64a19; }
-        .gf-action-btn {
-            width: 100%;
-            margin-top: 8px;
-            padding: 10px;
-            color: #fff;
-            border: none;
-            border-radius: 8px;
-            font-size: 13px;
-            cursor: pointer;
-            font-weight: 500;
-            transition: all 0.2s;
-        }
-        .gf-action-btn:hover { opacity: 0.9; transform: translateY(-1px); }
-        .gf-action-btn.primary { background: linear-gradient(135deg, #4caf50, #66bb6a); }
-        .gf-action-btn.warning { background: linear-gradient(135deg, #ff9800, #ffb74d); }
+        .gf-p{position:fixed;top:70px;right:20px;z-index:99999;background:#fff;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.15);padding:15px;width:280px;max-height:75vh;overflow-y:auto;display:none;font-family:system-ui,sans-serif}
+        .gf-t{font-weight:700;font-size:15px;color:#00a1d6;border-bottom:2px solid #00a1d6;padding-bottom:10px;margin-bottom:12px;display:flex;justify-content:space-between}
+        .gf-x{cursor:pointer;color:#999}.gf-x:hover{color:red}
+        .gf-c{background:#fff3e0;padding:8px 10px;border-radius:6px;margin-bottom:10px;font-size:12px;display:flex;justify-content:space-between;align-items:center}
+        .gf-i{padding:10px 12px;margin:5px 0;background:#f5f5f5;border-radius:8px;cursor:pointer;display:flex;justify-content:space-between;font-size:14px;transition:.2s}
+        .gf-i:hover{background:#e3f2fd}.gf-i.on{background:#00a1d6;color:#fff}
+        .gf-s{font-size:12px;color:#666;text-align:center;padding:8px 0;border-top:1px solid #eee;margin-top:10px}
+        .gf-b{width:100%;padding:10px;margin-top:8px;border:none;border-radius:8px;color:#fff;font-size:13px;cursor:pointer}
+        .gf-b:hover{opacity:.9}.gf-g{background:linear-gradient(135deg,#4caf50,#66bb6a)}.gf-o{background:linear-gradient(135deg,#ff9800,#ffb74d)}
+        .gf-cb{background:#ff5722;padding:4px 10px;font-size:12px;border-radius:4px;border:none;color:#fff;cursor:pointer}
+        .gf-tip{font-size:11px;color:#888;margin-top:10px;line-height:1.5;background:#f9f9f9;padding:8px;border-radius:6px}
+        .gf-btn{position:fixed;top:70px;right:20px;z-index:100000;background:linear-gradient(135deg,#00a1d6,#00b5e5);color:#fff;border:none;padding:12px 18px;border-radius:25px;cursor:pointer;font-size:14px;box-shadow:0 4px 15px rgba(0,161,214,.4)}
+        .gf-btn:hover{transform:translateY(-2px)}.gf-btn.on{background:linear-gradient(135deg,#ff9800,#ffb74d)}
+        .gf-ld{position:fixed;bottom:80px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.8);color:#fff;padding:10px 20px;border-radius:20px;font-size:13px;z-index:99999;display:none}
     `);
 
-    // ==================== UI ====================
+    // ========== UI ==========
     function createUI() {
         const btn = document.createElement('button');
-        btn.className = 'gf-btn';
-        btn.id = 'gf-toggle-btn';
-
-        if (currentGroupId) {
-            btn.classList.add('filtering');
-            const name = GM_getValue('currentGroupName', '筛选中');
-            btn.innerHTML = `🔍 ${name}`;
-        } else {
-            btn.innerHTML = '📁 分组筛选';
-        }
+        btn.className = 'gf-btn' + (currentGroupId ? ' on' : '');
+        btn.id = 'gf-btn';
+        btn.textContent = currentGroupId ? `🔍 ${GM_getValue('currentGroupName', '')}` : '📁 分组筛选';
         document.body.appendChild(btn);
 
         const panel = document.createElement('div');
-        panel.className = 'gf-container';
-        panel.id = 'gf-panel';
-        panel.innerHTML = '<div class="gf-loading">加载中...</div>';
+        panel.className = 'gf-p';
+        panel.id = 'gf-p';
         document.body.appendChild(panel);
 
-        btn.addEventListener('click', () => {
+        const ld = document.createElement('div');
+        ld.className = 'gf-ld';
+        ld.id = 'gf-ld';
+        ld.textContent = '🔄 正在加载更多历史动态...';
+        document.body.appendChild(ld);
+
+        btn.onclick = () => {
             panelVisible = !panelVisible;
             panel.style.display = panelVisible ? 'block' : 'none';
             btn.style.display = panelVisible ? 'none' : 'block';
-            if (panelVisible && groups.length === 0) {
-                loadGroups();
-            }
-        });
+            if (panelVisible && !groups.length) loadGroups();
+        };
+    }
+
+    function showLoading(show) {
+        const ld = document.getElementById('gf-ld');
+        if (ld) ld.style.display = show ? 'block' : 'none';
     }
 
     function loadGroups() {
+        const p = document.getElementById('gf-p');
+        p.innerHTML = '<div style="text-align:center;padding:20px;color:#999">加载中...</div>';
         GM_xmlhttpRequest({
             method: 'GET',
             url: 'https://api.bilibili.com/x/relation/tags',
             withCredentials: true,
-            headers: { 'Referer': 'https://t.bilibili.com/' },
-            onload: function(response) {
+            onload: r => {
                 try {
-                    const data = JSON.parse(response.responseText);
-                    if (data.code === 0 && data.data) {
-                        groups = data.data;
-                        renderPanel();
-                    } else {
-                        document.getElementById('gf-panel').innerHTML =
-                            '<div class="gf-loading">⚠️ 获取分组失败，请确保已登录B站</div>';
-                    }
-                } catch (e) {
-                    document.getElementById('gf-panel').innerHTML =
-                        '<div class="gf-loading">⚠️ 数据解析错误</div>';
-                }
-            },
-            onerror: () => {
-                document.getElementById('gf-panel').innerHTML =
-                    '<div class="gf-loading">⚠️ 网络错误</div>';
+                    const d = JSON.parse(r.responseText);
+                    if (d.code === 0 && d.data) { groups = d.data; render(); }
+                    else p.innerHTML = '<div style="color:red;padding:20px">获取失败，请确保已登录</div>';
+                } catch { p.innerHTML = '<div style="color:red;padding:20px">解析错误</div>'; }
             }
         });
     }
 
-    function renderPanel() {
-        const panel = document.getElementById('gf-panel');
-        const savedGroupName = GM_getValue('currentGroupName', '');
+    function render() {
+        const p = document.getElementById('gf-p');
+        const name = GM_getValue('currentGroupName', '');
+        let h = `<div class="gf-t"><span>📁 分组筛选</span><span class="gf-x" id="gf-x">✕</span></div>`;
+        if (currentGroupId && name) h += `<div class="gf-c"><span>🔍 ${name}</span><button class="gf-cb" id="gf-cl">取消</button></div>`;
+        h += `<div class="gf-i ${!currentGroupId?'on':''}" data-id="all"><span>📺 全部动态</span></div>`;
+        groups.forEach(g => h += `<div class="gf-i ${currentGroupId===g.tagid?'on':''}" data-id="${g.tagid}" data-n="${g.name}"><span>📂 ${g.name}</span><span style="font-size:12px;opacity:.7">${g.count}</span></div>`);
+        h += `<div class="gf-s" id="gf-s">${currentGroupId ? `显示 ${filterStats.shown} 条` : '选择分组开始筛选'}</div>`;
+        h += `<button class="gf-b gf-g" id="gf-r">🔄 刷新页面</button>`;
+        h += `<button class="gf-b gf-o" id="gf-cc">🗑️ 清除缓存</button>`;
+        h += `<div class="gf-tip">💡 选择分组后刷新页面，向下滚动会自动加载更多历史动态</div>`;
+        p.innerHTML = h;
 
-        let html = `
-            <div class="gf-title">
-                <span>📁 关注分组筛选</span>
-                <span class="gf-close" id="gf-close">✕</span>
-            </div>
-        `;
-
-        if (currentGroupId && savedGroupName) {
-            html += `
-                <div class="gf-current">
-                    <span>🔍 当前：<strong>${savedGroupName}</strong></span>
-                    <button class="gf-clear-btn" id="gf-clear">取消筛选</button>
-                </div>
-            `;
-        }
-
-        html += `
-            <div class="gf-item ${!currentGroupId ? 'active' : ''}" data-id="all">
-                <span>📺 显示全部动态</span>
-            </div>
-        `;
-
-        groups.forEach(g => {
-            html += `
-                <div class="gf-item ${currentGroupId === g.tagid ? 'active' : ''}" data-id="${g.tagid}" data-name="${g.name}">
-                    <span>📂 ${g.name}</span>
-                    <span class="count">${g.count}人</span>
-                </div>
-            `;
-        });
-
-        html += `
-            <div class="gf-status" id="gf-status">
-                ${currentGroupId ? `✅ 筛选中 | 显示 ${filterStats.shown} 条` : '选择分组开始筛选'}
-            </div>
-
-            <button id="gf-refresh-btn" class="gf-action-btn primary">🔄 刷新页面应用筛选</button>
-            <button id="gf-clearcache-btn" class="gf-action-btn warning">🗑️ 清除缓存重新加载</button>
-
-            <div class="gf-tip">
-                ⚠️ <strong>重要说明：</strong><br>
-                B站动态API限制只能获取<strong>最近几个月</strong>的动态，这是B站服务器的限制，无法突破。<br><br>
-                📖 使用方法：选择分组 → 点击刷新 → 向下滚动加载更多
-            </div>
-        `;
-        panel.innerHTML = html;
-
-        // 绑定事件
-        document.getElementById('gf-close').addEventListener('click', () => {
+        document.getElementById('gf-x').onclick = () => {
             panelVisible = false;
-            panel.style.display = 'none';
-            document.getElementById('gf-toggle-btn').style.display = 'block';
-        });
-
-        const clearBtn = document.getElementById('gf-clear');
-        if (clearBtn) {
-            clearBtn.addEventListener('click', clearFilter);
-        }
-
-        document.getElementById('gf-refresh-btn').addEventListener('click', () => {
-            location.reload();
-        });
-
-        document.getElementById('gf-clearcache-btn').addEventListener('click', async () => {
-            groups.forEach(g => {
-                GM_setValue(`members_${g.tagid}`, null);
-                GM_setValue(`members_${g.tagid}_time`, 0);
-            });
-            if (currentGroupId) {
-                GM_setValue(`members_${currentGroupId}`, null);
-                GM_setValue(`members_${currentGroupId}_time`, 0);
-            }
-            alert('缓存已清除，即将刷新页面');
-            location.reload();
-        });
-
-        // 分组点击
-        panel.querySelectorAll('.gf-item').forEach(item => {
-            item.addEventListener('click', async () => {
-                const tagId = item.dataset.id;
-                const tagName = item.dataset.name || '';
-
-                panel.querySelectorAll('.gf-item').forEach(i => i.classList.remove('active'));
-                item.classList.add('active');
-
-                if (tagId === 'all') {
-                    clearFilter();
-                } else {
-                    await selectGroup(parseInt(tagId), tagName);
-                }
-            });
+            p.style.display = 'none';
+            document.getElementById('gf-btn').style.display = 'block';
+        };
+        document.getElementById('gf-r').onclick = () => location.reload();
+        document.getElementById('gf-cc').onclick = () => {
+            groups.forEach(g => { GM_setValue(`m_${g.tagid}`, null); GM_setValue(`t_${g.tagid}`, 0); });
+            alert('缓存已清除'); location.reload();
+        };
+        const cl = document.getElementById('gf-cl');
+        if (cl) cl.onclick = clear;
+        p.querySelectorAll('.gf-i').forEach(i => i.onclick = () => {
+            const id = i.dataset.id;
+            id === 'all' ? clear() : select(+id, i.dataset.n);
         });
     }
 
-    function updateStatusText() {
-        const el = document.getElementById('gf-status');
-        if (el && currentGroupId) {
-            el.textContent = `✅ 筛选中 | 已显示 ${filterStats.shown} 条，已过滤 ${filterStats.total - filterStats.shown} 条`;
+    function updateUI() {
+        const s = document.getElementById('gf-s');
+        if (s && currentGroupId) {
+            s.textContent = `显示 ${filterStats.shown} 条，过滤 ${filterStats.total - filterStats.shown} 条`;
         }
     }
 
-    async function selectGroup(tagId, tagName) {
-        const statusEl = document.getElementById('gf-status');
-        if (statusEl) statusEl.textContent = '正在加载分组成员...';
-
-        // 清除缓存获取最新数据
-        GM_setValue(`members_${tagId}`, null);
-        GM_setValue(`members_${tagId}_time`, 0);
-
-        const members = await getGroupMembersSync(tagId);
-
-        if (members.length === 0) {
-            if (statusEl) statusEl.textContent = '⚠️ 该分组没有成员';
-            return;
-        }
-
-        currentGroupId = tagId;
-        currentGroupMemberSet = new Set(members.map(m => String(m)));
+    async function select(id, name) {
+        const s = document.getElementById('gf-s');
+        if (s) s.textContent = '加载分组成员...';
+        GM_setValue(`m_${id}`, null);
+        GM_setValue(`t_${id}`, 0);
+        const m = await fetchMembers(id);
+        if (!m?.length) { if (s) s.textContent = '该分组没有成员'; return; }
+        
+        currentGroupId = id;
+        currentGroupMemberSet = new Set(m.map(String));
         filterStats = { total: 0, shown: 0 };
-
-        GM_setValue('currentGroupId', tagId);
-        GM_setValue('currentGroupName', tagName);
-
-        debugLog(`已选择分组: ${tagName}, 成员数: ${members.length}`);
-
-        const btn = document.getElementById('gf-toggle-btn');
-        btn.classList.add('filtering');
-        btn.innerHTML = `🔍 ${tagName}`;
-
-        if (statusEl) {
-            statusEl.textContent = `已选择「${tagName}」(${members.length}人)，请刷新页面`;
-        }
-
-        renderPanel();
+        hasMore = true;
+        emptyCount = 0;
+        
+        GM_setValue('currentGroupId', id);
+        GM_setValue('currentGroupName', name);
+        
+        const btn = document.getElementById('gf-btn');
+        btn.className = 'gf-btn on';
+        btn.textContent = `🔍 ${name}`;
+        
+        render();
     }
 
-    function clearFilter() {
+    function clear() {
         currentGroupId = null;
         currentGroupMemberSet = null;
         filterStats = { total: 0, shown: 0 };
-
+        emptyCount = 0;
+        
         GM_setValue('currentGroupId', null);
         GM_setValue('currentGroupName', '');
-
-        const btn = document.getElementById('gf-toggle-btn');
-        btn.classList.remove('filtering');
-        btn.innerHTML = '📁 分组筛选';
-
-        renderPanel();
+        
+        const btn = document.getElementById('gf-btn');
+        btn.className = 'gf-btn';
+        btn.textContent = '📁 分组筛选';
+        
+        showLoading(false);
+        render();
     }
 
-    // ==================== 初始化 ====================
-    function init() {
-        if (document.body) {
-            createUI();
-            debugLog('v11.0 最终修复版已加载');
-        } else {
-            document.addEventListener('DOMContentLoaded', init);
-        }
-    }
-
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', init);
-    } else {
-        setTimeout(init, 0);
-    }
-
+    // ========== 启动 ==========
+    if (document.body) { createUI(); log('v16.1 已加载'); }
+    else document.addEventListener('DOMContentLoaded', () => { createUI(); log('v16.1 已加载'); });
 })();
