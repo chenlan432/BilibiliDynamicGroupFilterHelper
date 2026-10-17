@@ -1,0 +1,12 @@
+{
+  "name": "bilibili-dynamic-group-filter-helper",
+  "version": "18.0.0",
+  "private": true,
+  "description": "B站动态分组筛选助手用户脚本",
+  "license": "MIT",
+  "scripts": {
+    "check": "node --check \"B站动态分组筛选助手.js\"",
+    "test": "node --test tests/userscript.test.mjs",
+    "verify": "node --check \"B站动态分组筛选助手.js\" && node --test tests/userscript.test.mjs"
+  }
+}
